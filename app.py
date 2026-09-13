@@ -1,208 +1,352 @@
 import os
-import json
-import time
-import threading
 import requests
-from datetime import datetime
-from flask import Flask
-import telebot
-
-app = Flask(__name__)
-
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-API_KEY = os.getenv("API_KEY") or os.getenv("API_FOOTBALL_KEY")
-API_HOST = "v3.football.api-sports.io"
-STATS_FILE = "stats.json"
-
-print(f"TOKEN: {bool(TOKEN)} | API_KEY: {bool(API_KEY)}")
-
-bot = None
-if TOKEN:
-    bot = telebot.TeleBot(TOKEN, threaded=False)
-
-cache = {"pronos": None, "time": 0}
-
-def load_stats():
-    if os.path.exists(STATS_FILE):
-        try:
-            with open(STATS_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Erreur lecture stats: {e}")
-    return {"gagnes": 0, "perdus": 0, "benef": 0.0}
-
-def save_stats():
-    try:
-        with open(STATS_FILE, "w") as f:
-            json.dump(stats, f)
-    except Exception as e:
-        print(f"Erreur sauvegarde stats: {e}")
-
-stats = load_stats()
-
-def get_pronos():
-    if time.time() - cache["time"] < 1800 and cache["pronos"]:
-        return cache["pronos"]
-    if not API_KEY:
-        return "API_KEY manquant."
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        headers = {"x-apisports-key": API_KEY}
-        r = requests.get(f"https://{API_HOST}/predictions?date={today}", headers=headers, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        resp = data.get("response", [])
-        if not resp:
-            return f"Pas de predictions pour {today} (API vide)."
-        msg = f"GAZO V31.3 - TOP 5 PRONOS {today}\n\n"
-        for i, item in enumerate(resp[:5]):
-            try:
-                teams = item["teams"]
-                pred = item["predictions"]
-                league = item["league"]["name"]
-                msg += f"{i+1}. [{league}] {teams['home']['name']} vs {teams['away']['name']}\n"
-                msg += f" -> {pred.get('advice', 'N/A')} ({pred.get('winning_percent', '?')})\n\n"
-            except (KeyError, TypeError):
-                continue
-        cache["pronos"] = msg
-        cache["time"] = time.time()
-        return msg
-    except Exception as e:
-        print(f"API ERROR: {e}")
-        return "Erreur de connexion a l'API."
-
-HELP_TEXT = (
-    "GAZO V31.3 - LIVE VERT\n\n"
-    "Commandes dispo:\n"
-    "/prono - Top pronos du jour\n"
-    "/live - Matchs 70'+\n"
-    "/bilan - Ton bilan\n"
-    "/win <montant> - Pari gagne\n"
-    "/lose <montant> - Pari perdu\n"
-    "/recap - Resume complet\n"
-    "/help - Cette aide"
+from datetime import datetime, date
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
 )
 
-if bot:
-    @bot.message_handler(commands=['start', 'help'])
-    def cmd_start(m):
-        bot.reply_to(m, HELP_TEXT)
+# =========================
+# CONFIGURATION
+# =========================
 
-    @bot.message_handler(commands=['prono'])
-    def cmd_prono(m):
-        bot.send_message(m.chat.id, "Analyse GAZO en cours... 1 min")
-        txt = get_pronos()
-        bot.send_message(m.chat.id, txt)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 
-    @bot.message_handler(commands=['live'])
-    def cmd_live(m):
-        if not API_KEY:
-            bot.reply_to(m, "API_KEY manquant.")
-            return
-        try:
-            headers = {"x-apisports-key": API_KEY}
-            r = requests.get(f"https://{API_HOST}/fixtures?live=all", headers=headers, timeout=15)
-            r.raise_for_status()
-            live = r.json().get("response", [])
-            if not live:
-                bot.reply_to(m, "Aucun match live actuellement.")
-                return
-            msg = "LIVE 70'+ - OPPORTUNITES\n\n"
-            count = 0
-            for g in live:
-                try:
-                    el = g["fixture"]["status"]["elapsed"] or 0
-                    if el >= 70:
-                        home = g["teams"]["home"]["name"]
-                        away = g["teams"]["away"]["name"]
-                        gh = g["goals"]["home"]
-                        ga = g["goals"]["away"]
-                        msg += f"{home} {gh}-{ga} {away} ({el}')\n"
-                        if gh == ga:
-                            msg += " Pari: +0.5 But ou Nul safe\n"
-                        elif abs(gh - ga) == 1:
-                            msg += " Pari: Double Chance\n"
-                        msg += "\n"
-                        count += 1
-                except (KeyError, TypeError):
-                    continue
-            if count == 0:
-                msg += "Pas de match >=70' pour l'instant."
-            bot.send_message(m.chat.id, msg)
-        except Exception as e:
-            print(f"LIVE ERROR: {e}")
-            bot.reply_to(m, "Erreur API live.")
+API_URL = "https://v3.football.api-sports.io"
+MAX_LANCEMENTS_PAR_JOUR = 9
 
-    @bot.message_handler(commands=['bilan'])
-    def cmd_bilan(m):
-        total = stats["gagnes"] + stats["perdus"]
-        roi = (stats["benef"] / total * 100) if total > 0 else 0
-        msg = (
-            f"BILAN GAZO\n\n"
-            f"Gagnes: {stats['gagnes']}\n"
-            f"Perdus: {stats['perdus']}\n"
-            f"Total: {total}\n"
-            f"Benef: {stats['benef']:.2f}EUR\n"
-            f"ROI: {roi:.1f}%"
+lancements_du_jour = 0
+date_compteur = date.today()
+
+
+# =========================
+# OUTILS
+# =========================
+
+def verifier_limite():
+    global lancements_du_jour, date_compteur
+
+    aujourd_hui = date.today()
+
+    if aujourd_hui != date_compteur:
+        date_compteur = aujourd_hui
+        lancements_du_jour = 0
+
+    if lancements_du_jour >= MAX_LANCEMENTS_PAR_JOUR:
+        return False
+
+    lancements_du_jour += 1
+    return True
+
+
+def appel_api(endpoint, params=None):
+    headers = {
+        "x-apisports-key": API_FOOTBALL_KEY
+    }
+
+    try:
+        response = requests.get(
+            API_URL + endpoint,
+            headers=headers,
+            params=params,
+            timeout=15
         )
-        bot.reply_to(m, msg)
 
-    def _parse_amount(m):
-        parts = m.text.split()
-        if len(parts) < 2:
-            return None
-        try:
-            return float(parts[1].replace(",", "."))
-        except ValueError:
+        if response.status_code != 200:
             return None
 
-    @bot.message_handler(commands=['win'])
-    def cmd_win(m):
-        amount = _parse_amount(m)
-        if amount is None:
-            bot.reply_to(m, "Usage: /win <montant> (ex: /win 15.50)")
-            return
-        stats["gagnes"] += 1
-        stats["benef"] += amount
-        save_stats()
-        bot.reply_to(m, f"Pari gagne +{amount:.2f}EUR. Benef: {stats['benef']:.2f}EUR")
+        data = response.json()
+        return data.get("response", [])
 
-    @bot.message_handler(commands=['lose'])
-    def cmd_lose(m):
-        amount = _parse_amount(m)
-        if amount is None:
-            bot.reply_to(m, "Usage: /lose <montant> (ex: /lose 10)")
-            return
-        stats["perdus"] += 1
-        stats["benef"] -= amount
-        save_stats()
-        bot.reply_to(m, f"Pari perdu -{amount:.2f}EUR. Benef: {stats['benef']:.2f}EUR")
+    except requests.RequestException:
+        return None
 
-    @bot.message_handler(commands=['recap'])
-    def cmd_recap(m):
-        total = stats["gagnes"] + stats["perdus"]
-        roi = (stats["benef"] / total * 100) if total > 0 else 0
-        bilan = (
-            f"Bilan: {stats['gagnes']}G / {stats['perdus']}P "
-            f"| Benef: {stats['benef']:.2f}EUR | ROI: {roi:.1f}%\n\n"
-        )
-        bot.send_message(m.chat.id, bilan + get_pronos())
 
-    def run_bot():
-        print("Bot polling started...")
-        while True:
+def valeur_statistique(statistiques, nom):
+    for stat in statistiques:
+        if stat.get("type") == nom:
+            valeur = stat.get("value")
+
+            if valeur is None:
+                return 0
+
+            if isinstance(valeur, str):
+                valeur = valeur.replace("%", "")
+
             try:
-                bot.infinity_polling(timeout=60, long_polling_timeout=60)
-            except Exception as e:
-                print(f"Polling crash: {e}")
-                time.sleep(5)
+                return float(valeur)
+            except ValueError:
+                return 0
 
-    threading.Thread(target=run_bot, daemon=True).start()
+    return 0
 
-@app.route('/')
-def home():
-    return "GAZO V31.3 LIVE OK"
+
+def obtenir_statistiques(fixture_id):
+    resultat = appel_api(
+        "/fixtures/statistics",
+        {"fixture": fixture_id}
+    )
+
+    if not resultat or len(resultat) < 2:
+        return None
+
+    equipe_domicile = resultat[0].get("statistics", [])
+    equipe_exterieure = resultat[1].get("statistics", [])
+
+    return {
+        "possession_dom": valeur_statistique(
+            equipe_domicile, "Ball Possession"
+        ),
+        "possession_ext": valeur_statistique(
+            equipe_exterieure, "Ball Possession"
+        ),
+        "tirs_cadres_dom": valeur_statistique(
+            equipe_domicile, "Shots on Goal"
+        ),
+        "tirs_cadres_ext": valeur_statistique(
+            equipe_exterieure, "Shots on Goal"
+        ),
+        "attaques_dangereuses_dom": valeur_statistique(
+            equipe_domicile, "Dangerous Attacks"
+        ),
+        "attaques_dangereuses_ext": valeur_statistique(
+            equipe_exterieure, "Dangerous Attacks"
+        ),
+        "corners_dom": valeur_statistique(
+            equipe_domicile, "Corner Kicks"
+        ),
+        "corners_ext": valeur_statistique(
+            equipe_exterieure, "Corner Kicks"
+        ),
+        "cartons_rouges_dom": valeur_statistique(
+            equipe_domicile, "Red Cards"
+        ),
+        "cartons_rouges_ext": valeur_statistique(
+            equipe_exterieure, "Red Cards"
+        ),
+    }
+
+
+def pronostic_buts(total_buts, tirs_cadres, attaques_dangereuses):
+    """
+    Analyse prudente basée sur les buts déjà marqués
+    et l'activité offensive observée.
+    """
+
+    lignes = [1.5, 2.5, 3.5, 4.5]
+    resultats = []
+
+    for ligne in lignes:
+        if total_buts > ligne:
+            conseil = "OVER déjà validé"
+        elif total_buts == ligne:
+            conseil = "Ligne presque validée"
+        elif tirs_cadres >= 6 and attaques_dangereuses >= 100:
+            conseil = "OVER possible, activité élevée"
+        elif tirs_cadres <= 2 and attaques_dangereuses < 70:
+            conseil = "UNDER plus prudent"
+        else:
+            conseil = "Match incertain"
+
+        resultats.append(f"{ligne} buts : {conseil}")
+
+    return "\n".join(resultats)
+
+
+def analyser_match(match):
+    fixture = match["fixture"]
+    equipes = match["teams"]
+    buts = match["goals"]
+    statut = fixture["status"]
+
+    minute = statut.get("elapsed") or 0
+
+    domicile = equipes["home"]["name"]
+    exterieur = equipes["away"]["name"]
+
+    buts_dom = buts.get("home") or 0
+    buts_ext = buts.get("away") or 0
+    total_buts = buts_dom + buts_ext
+
+    statistiques = obtenir_statistiques(fixture["id"])
+
+    if not statistiques:
+        return None
+
+    if (
+        statistiques["cartons_rouges_dom"] > 0
+        or statistiques["cartons_rouges_ext"] > 0
+    ):
+        return None
+
+    possession_dom = statistiques["possession_dom"]
+    possession_ext = statistiques["possession_ext"]
+
+    tirs_dom = statistiques["tirs_cadres_dom"]
+    tirs_ext = statistiques["tirs_cadres_ext"]
+
+    attaques_dom = statistiques["attaques_dangereuses_dom"]
+    attaques_ext = statistiques["attaques_dangereuses_ext"]
+
+    tirs_total = tirs_dom + tirs_ext
+    attaques_total = attaques_dom + attaques_ext
+
+    pression_dom = possession_dom + attaques_dom + tirs_dom * 5
+    pression_ext = possession_ext + attaques_ext + tirs_ext * 5
+
+    if pression_dom > pression_ext + 35:
+        tendance = f"Avantage statistique : {domicile}"
+        resultat = "1X"
+    elif pression_ext > pression_dom + 35:
+        tendance = f"Avantage statistique : {exterieur}"
+        resultat = "X2"
+    else:
+        tendance = "Pression relativement équilibrée"
+        resultat = "1X ou X2 selon le contexte"
+
+    if buts_dom == buts_ext:
+        issue = "Match nul actuellement"
+    elif buts_dom > buts_ext:
+        issue = f"{domicile} mène"
+    else:
+        issue = f"{exterieur} mène"
+
+    analyse_buts = pronostic_buts(
+        total_buts,
+        tirs_total,
+        attaques_total
+    )
+
+    texte = (
+        f"⚽ {domicile} {buts_dom} - {buts_ext} {exterieur}\n"
+        f"⏱️ Minute : {minute}'\n\n"
+        f"📊 Possession : {possession_dom:.0f}% - "
+        f"{possession_ext:.0f}%\n"
+        f"🎯 Tirs cadrés : {tirs_dom:.0f} - {tirs_ext:.0f}\n"
+        f"🔥 Attaques dangereuses : {attaques_dom:.0f} - "
+        f"{attaques_ext:.0f}\n\n"
+        f"🧠 Situation : {issue}\n"
+        f"📈 Tendance : {tendance}\n"
+        f"🔎 Double chance : {resultat}\n\n"
+        f"🥅 Analyse des lignes de buts :\n"
+        f"{analyse_buts}\n\n"
+        f"⚠️ Pronostic statistique, sans garantie."
+    )
+
+    return texte
+
+
+def obtenir_pronostics_live():
+    matchs = appel_api("/fixtures", {"live": "all"})
+
+    if matchs is None:
+        return "❌ Impossible de contacter API-Football."
+
+    selection = []
+
+    for match in matchs:
+        minute = match["fixture"]["status"].get("elapsed") or 0
+
+        # Analyse principalement entre la 70e et la 90e minute
+        if 70 <= minute <= 95:
+            selection.append(match)
+
+    if not selection:
+        return "🔴 Aucun match intéressant entre la 70e et la 95e minute."
+
+    messages = [
+        "🔴 GAZO LIVE ULTIME 🔴",
+        "📊 Analyse statistique des matchs en direct\n"
+    ]
+
+    # Limite pour éviter de consommer trop de requêtes API
+    for match in selection[:8]:
+        analyse = analyser_match(match)
+
+        if analyse:
+            messages.append(analyse)
+            messages.append("\n" + "─" * 35 + "\n")
+
+    if len(messages) == 2:
+        return "⚠️ Aucun match n'a fourni assez de statistiques."
+
+    return "\n".join(messages)
+
+
+# =========================
+# COMMANDES TELEGRAM
+# =========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = (
+        "👋 Bienvenue sur GAZO LIVE ULTIME.\n\n"
+        "Utilise /live pour analyser les matchs en direct.\n"
+        "Limite : 9 lancements par jour."
+    )
+
+    await update.message.reply_text(message)
+
+
+async def live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global lancements_du_jour
+
+    if not verifier_limite():
+        await update.message.reply_text(
+            "🛑 Limite quotidienne atteinte.\n"
+            "Reviens demain pour continuer."
+        )
+        return
+
+    await update.message.reply_text(
+        f"⏳ Analyse en cours...\n"
+        f"Lancement {lancements_du_jour}/{MAX_LANCEMENTS_PAR_JOUR}"
+    )
+
+    resultat = obtenir_pronostics_live()
+
+    await update.message.reply_text(
+        resultat,
+        disable_web_page_preview=True
+    )
+
+
+async def statut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global lancements_du_jour
+
+    await update.message.reply_text(
+        f"📊 Lancements utilisés aujourd'hui : "
+        f"{lancements_du_jour}/{MAX_LANCEMENTS_PAR_JOUR}"
+    )
+
+
+# =========================
+# LANCEMENT DU BOT
+# =========================
+
+def main():
+    if not TELEGRAM_TOKEN or not API_FOOTBALL_KEY:
+        raise ValueError(
+            "Les variables TELEGRAM_TOKEN et API_FOOTBALL_KEY "
+            "doivent être configurées sur Render."
+        )
+
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("live", live))
+    application.add_handler(CommandHandler("statut", statut))
+
+    print("🤖 GAZO LIVE ULTIME est démarré.")
+
+    application.run_polling()
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    main()
